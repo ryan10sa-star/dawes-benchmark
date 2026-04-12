@@ -15,6 +15,7 @@ Max score per 60-question run: 180
 Results reported as percentage.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -194,6 +195,236 @@ def score_answer(question, reference_answer, model_answer, judge="anthropic",
 
 MULTI_JUDGE_DISAGREEMENT_THRESHOLD = 15  # points on 0-100 scale
 
+# ---------------------------------------------------------------------------
+# OpenRouter multi-judge panel
+# ---------------------------------------------------------------------------
+
+JUDGE_PANEL = [
+    "anthropic/claude-sonnet-4-6",
+    "openai/gpt-4o",
+    "google/gemini-2.5-flash",
+    "meta-llama/llama-3.1-70b-instruct",
+    "mistralai/mistral-large",
+]
+
+# Short display names keyed by full model identifier
+_PANEL_SHORT_NAMES = {
+    "anthropic/claude-sonnet-4-6": "claude-sonnet",
+    "openai/gpt-4o": "gpt-4o",
+    "google/gemini-2.5-flash": "gemini-flash",
+    "meta-llama/llama-3.1-70b-instruct": "llama-70b",
+    "mistralai/mistral-large": "mistral-large",
+}
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_EXTRA_HEADERS = {
+    "HTTP-Referer": "https://relayforge.tools",
+    "X-Title": "DAWES Benchmark",
+}
+
+PANEL_JUDGE_SYSTEM_PROMPT = (
+    "You are an expert scorer for the DAWES Benchmark — an Instrumentation "
+    "& Controls domain knowledge test. Score the following answer on a 0-100 "
+    "integer scale:\n"
+    "   0-20  = Wrong or no answer\n"
+    "  21-50  = Partially correct\n"
+    "  51-80  = Correct\n"
+    "  81-100 = Correct with strong reasoning\n\n"
+    "Respond with ONLY a JSON object: "
+    "{\"score\": <0-100>, \"reasoning\": \"<brief explanation>\"}"
+)
+
+
+async def _call_openrouter_judge_async(model, prompt):
+    """Call a single OpenRouter judge model asynchronously.
+
+    Args:
+        model: Full OpenRouter model identifier (e.g. "openai/gpt-4o").
+        prompt: The formatted judge prompt string.
+
+    Returns:
+        dict with 'score' (int 0-100) and 'reasoning' (str).
+
+    Raises:
+        EnvironmentError: If OPENROUTER_API_KEY is not set.
+        RuntimeError: If the API returns an unparseable response.
+    """
+    from openai import AsyncOpenAI  # import lazily to avoid hard dependency
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise EnvironmentError("OPENROUTER_API_KEY not set in environment")
+
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=OPENROUTER_BASE_URL,
+        default_headers=OPENROUTER_EXTRA_HEADERS,
+    )
+
+    response = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": PANEL_JUDGE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=256,
+        temperature=0,
+    )
+
+    content = response.choices[0].message.content.strip()
+    try:
+        data = json.loads(content)
+        score = max(0, min(100, int(data["score"])))
+        return {"score": score, "reasoning": data.get("reasoning", "")}
+    except (json.JSONDecodeError, KeyError, ValueError) as exc:
+        raise RuntimeError(
+            f"OpenRouter judge '{model}' returned unparseable response: "
+            f"{content!r}"
+        ) from exc
+
+
+async def _score_answer_panel_async(question, reference_answer, model_answer,
+                                    model_name=None):
+    """Score a single answer using the full 5-model OpenRouter panel.
+
+    All five judges are queried in parallel. The highest and lowest scores
+    are dropped as outliers; the remaining three are averaged. If any two
+    judges disagree by more than MULTI_JUDGE_DISAGREEMENT_THRESHOLD points
+    the answer is flagged as "contested" for human review.
+
+    Args:
+        question: The benchmark question text.
+        reference_answer: The reference/expected answer.
+        model_answer: The model's response.
+        model_name: The name of the model being scored (omitted when None).
+
+    Returns:
+        dict with:
+            - score (float): Normalised 0-3 score derived from the panel
+              average (compatible with run_benchmark total calculation).
+            - total (int): Rounded panel average on the 0-100 scale.
+            - judge_scores (dict): Per-judge scores keyed by short name.
+            - contested (bool): True when disagreement > threshold.
+            - outliers_dropped (list[str]): "<short_name>:<score>" entries
+              for the dropped high and low scores.
+            - reasoning (str): Combined judge reasoning.
+            - judge_error (bool): Present and True if any judge failed.
+    """
+    prompt = build_judge_prompt(question, reference_answer, model_answer,
+                                model_name=model_name)
+
+    tasks = {model: _call_openrouter_judge_async(model, prompt)
+             for model in JUDGE_PANEL}
+
+    raw_results = await asyncio.gather(
+        *tasks.values(), return_exceptions=True
+    )
+
+    judge_scores = {}
+    reasoning_parts = []
+    any_error = False
+
+    for model, result in zip(tasks.keys(), raw_results):
+        short = _PANEL_SHORT_NAMES[model]
+        if isinstance(result, Exception):
+            logger.warning("Panel judge '%s' failed: %s", model, result)
+            any_error = True
+        else:
+            judge_scores[short] = result["score"]
+            if result.get("reasoning"):
+                reasoning_parts.append(f"[{short}] {result['reasoning']}")
+
+    valid_scores = list(judge_scores.items())  # list of (short_name, score)
+
+    if not valid_scores:
+        ret = {
+            "score": None,
+            "total": None,
+            "judge_scores": {},
+            "contested": True,
+            "outliers_dropped": [],
+            "reasoning": "All panel judges failed to score.",
+            "judge_error": True,
+        }
+        return ret
+
+    # Sort by score to identify outliers
+    sorted_scores = sorted(valid_scores, key=lambda x: x[1])
+
+    outliers_dropped = []
+    trimmed_scores = sorted_scores
+
+    if len(sorted_scores) >= 3:
+        low_name, low_val = sorted_scores[0]
+        high_name, high_val = sorted_scores[-1]
+        outliers_dropped = [
+            f"{low_name}:{low_val}",
+            f"{high_name}:{high_val}",
+        ]
+        trimmed_scores = sorted_scores[1:-1]
+
+    if not trimmed_scores:
+        trimmed_scores = sorted_scores
+
+    trimmed_values = [v for _, v in trimmed_scores]
+    panel_avg = round(sum(trimmed_values) / len(trimmed_values))
+
+    # Check for contested: any two judges differ by > threshold
+    all_values = [v for _, v in valid_scores]
+    contested = (max(all_values) - min(all_values)) > MULTI_JUDGE_DISAGREEMENT_THRESHOLD
+
+    # Normalise to 0-3 scale for compatibility with run_benchmark
+    normalised_score = round((panel_avg / 100) * 3, 2)
+
+    ret = {
+        "score": normalised_score,
+        "total": panel_avg,
+        "judge_scores": dict(valid_scores),
+        "contested": contested,
+        "outliers_dropped": outliers_dropped,
+        "reasoning": "; ".join(reasoning_parts),
+    }
+    if any_error:
+        ret["judge_error"] = True
+    return ret
+
+
+def score_answer_panel(question, reference_answer, model_answer,
+                       model_name=None):
+    """Synchronous wrapper around the async OpenRouter panel scorer.
+
+    Runs the five-judge panel in a new event loop so it can be called
+    from synchronous code.
+
+    Args:
+        question: The benchmark question text.
+        reference_answer: The reference/expected answer.
+        model_answer: The model's response.
+        model_name: The name of the model being scored (omitted when None).
+
+    Returns:
+        Same dict as _score_answer_panel_async.
+    """
+    if not model_answer or not model_answer.strip():
+        return {
+            "score": 0,
+            "total": 0,
+            "judge_scores": {},
+            "contested": False,
+            "outliers_dropped": [],
+            "reasoning": "Model provided no answer.",
+        }
+
+    return asyncio.run(
+        _score_answer_panel_async(
+            question=question,
+            reference_answer=reference_answer,
+            model_answer=model_answer,
+            model_name=model_name,
+        )
+    )
+
+
 # Benchmark result versioning
 BENCHMARK_VERSION_BASE = "v1.0"       # Single-judge, non-blind runs
 BENCHMARK_VERSION_ENHANCED = "v1.2"   # Multi-judge and/or blind runs
@@ -304,7 +535,8 @@ def score_answer_multi_judge(question, reference_answer, model_answer,
 
 
 def run_benchmark(questions, model_fn, model_name="unknown",
-                  judge="anthropic", judges=None, blind=False):
+                  judge="anthropic", judges=None, blind=False,
+                  judge_panel=False):
     """Run the full benchmark against a model.
 
     Args:
@@ -314,11 +546,14 @@ def run_benchmark(questions, model_fn, model_name="unknown",
                   model's answer string.
         model_name: Display name of the model being tested.
         judge: Single judge provider key for scoring (used when judges
-               is not specified).
+               is not specified and judge_panel is False).
         judges: List of judge provider keys for multi-judge panel scoring.
                 When provided, overrides the single ``judge`` parameter.
         blind: When True, strips model name from judge context before
                scoring (blind judging mode).
+        judge_panel: When True, uses the OpenRouter 5-model judge panel
+                     (JUDGE_PANEL) with outlier removal and contested
+                     flagging. Overrides both ``judge`` and ``judges``.
 
     Returns:
         dict with benchmark results including per-question scores and
@@ -332,13 +567,21 @@ def run_benchmark(questions, model_fn, model_name="unknown",
     scored_count = 0
     judge_errors = 0
     human_review_count = 0
+    contested_count = 0
     max_possible = len(questions) * 3
 
     for q in questions:
         logger.info("Scoring question %s (tier %s)", q["id"], q["tier"])
         answer = model_fn(q["question"])
 
-        if use_multi:
+        if judge_panel:
+            score_result = score_answer_panel(
+                question=q["question"],
+                reference_answer=q["reference_answer"],
+                model_answer=answer,
+                model_name=effective_model_name,
+            )
+        elif use_multi:
             score_result = score_answer_multi_judge(
                 question=q["question"],
                 reference_answer=q["reference_answer"],
@@ -363,6 +606,8 @@ def run_benchmark(questions, model_fn, model_name="unknown",
             judge_errors += 1
         if score_result.get("human_review"):
             human_review_count += 1
+        if score_result.get("contested"):
+            contested_count += 1
         results.append({
             "question_id": q["id"],
             "tier": q["tier"],
@@ -376,7 +621,7 @@ def run_benchmark(questions, model_fn, model_name="unknown",
     run_result = {
         "model": model_name,
         "benchmark_version": determine_benchmark_version(
-            multi_judge=use_multi, blind=blind
+            multi_judge=(use_multi or judge_panel), blind=blind
         ),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "total_score": round(total_score, 2),
@@ -389,7 +634,11 @@ def run_benchmark(questions, model_fn, model_name="unknown",
         "results": results,
     }
 
-    if use_multi:
+    if judge_panel:
+        run_result["judge_panel"] = JUDGE_PANEL
+        run_result["contested_flagged"] = contested_count
+        run_result["human_review_flagged"] = human_review_count
+    elif use_multi:
         run_result["judges"] = judges
         run_result["human_review_flagged"] = human_review_count
     else:

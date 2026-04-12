@@ -15,10 +15,12 @@ import sys
 from datetime import datetime, timezone
 
 from benchmark_runner import (
+    JUDGE_PANEL,
     JUDGE_PROVIDERS,
     determine_benchmark_version,
     run_benchmark,
     score_answer_multi_judge,
+    score_answer_panel,
 )
 
 logging.basicConfig(
@@ -141,6 +143,15 @@ def parse_args(argv=None):
              "so judges score without knowing which model answered."
     )
     parser.add_argument(
+        "--judge-panel", action="store_true", default=False,
+        help="Use the OpenRouter 5-model judge panel for scoring "
+             "(claude-sonnet, gpt-4o, gemini-flash, llama-70b, mistral-large). "
+             "Requires OPENROUTER_API_KEY. Overrides --judge and --judges. "
+             "Drops highest/lowest scores (outlier removal), averages the "
+             "remaining three, and flags answers as 'contested' when any two "
+             "judges disagree by more than 15 points."
+    )
+    parser.add_argument(
         "--questions", default=None,
         help="Path to questions JSON file (default: evaluation_sample.json)"
     )
@@ -156,7 +167,10 @@ def main(argv=None):
     args = parse_args(argv)
 
     judges_list = args.judges if args.judges else None
-    judge_display = ", ".join(args.judges) if args.judges else args.judge
+    if args.judge_panel:
+        judge_display = "OpenRouter panel (" + ", ".join(JUDGE_PANEL) + ")"
+    else:
+        judge_display = ", ".join(args.judges) if args.judges else args.judge
     logger.info("DAWES Benchmark Runner")
     logger.info("Model: %s | Judge(s): %s | Blind: %s",
                 args.model, judge_display, args.blind)
@@ -173,6 +187,7 @@ def main(argv=None):
         judge=args.judge,
         judges=judges_list,
         blind=args.blind,
+        judge_panel=args.judge_panel,
     )
 
     save_results(result, output_dir=args.output_dir)
