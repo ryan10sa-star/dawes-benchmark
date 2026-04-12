@@ -15,6 +15,7 @@ import sys
 from datetime import datetime, timezone
 
 from benchmark_runner import (
+    JUDGE_PANEL,
     JUDGE_PROVIDERS,
     determine_benchmark_version,
     run_benchmark,
@@ -136,6 +137,16 @@ def parse_args(argv=None):
              "and disagreements > 15pts flagged for human review."
     )
     parser.add_argument(
+        "--judge-panel", action="store_true", default=False,
+        help="Enable OpenRouter multi-judge panel scoring. Sends each answer "
+             "to 5 judges simultaneously (Claude Sonnet, GPT-4o, Gemini Flash, "
+             "Llama-70B, Mistral Large), drops the highest and lowest scores, "
+             "and averages the remaining 3. Answers where any two judges "
+             "disagree by >15 points are flagged as 'contested' for human "
+             "review. Requires OPENROUTER_API_KEY in the environment. "
+             "When set, --judge and --judges are ignored."
+    )
+    parser.add_argument(
         "--blind", action="store_true", default=False,
         help="Enable blind judging — strips model name from judge context "
              "so judges score without knowing which model answered."
@@ -156,7 +167,12 @@ def main(argv=None):
     args = parse_args(argv)
 
     judges_list = args.judges if args.judges else None
-    judge_display = ", ".join(args.judges) if args.judges else args.judge
+    if args.judge_panel:
+        judge_display = "OpenRouter panel (" + ", ".join(JUDGE_PANEL) + ")"
+    elif args.judges:
+        judge_display = ", ".join(args.judges)
+    else:
+        judge_display = args.judge
     logger.info("DAWES Benchmark Runner")
     logger.info("Model: %s | Judge(s): %s | Blind: %s",
                 args.model, judge_display, args.blind)
@@ -173,6 +189,7 @@ def main(argv=None):
         judge=args.judge,
         judges=judges_list,
         blind=args.blind,
+        judge_panel=args.judge_panel,
     )
 
     save_results(result, output_dir=args.output_dir)
