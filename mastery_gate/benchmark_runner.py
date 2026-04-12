@@ -115,9 +115,20 @@ def call_judge_api(provider, prompt):
     )
 
 
+JUDGE_MAX_RETRIES = 3
+JUDGE_RETRY_BACKOFF_SECONDS = 5
+
+
 def score_answer(question, reference_answer, model_answer, judge="anthropic",
                  model_name=None):
     """Score a single model answer using the specified judge.
+
+    Includes retry logic for network resilience. If a judge API call fails
+    due to a network error, it retries up to JUDGE_MAX_RETRIES times with
+    JUDGE_RETRY_BACKOFF_SECONDS backoff between attempts. A score of 0 is
+    only assigned when the *model* failed to answer — not when the judge
+    fails to score. If all retries are exhausted, the result is flagged
+    with ``judge_error: True``.
 
     Args:
         question: The benchmark question text.
@@ -131,6 +142,8 @@ def score_answer(question, reference_answer, model_answer, judge="anthropic",
             - score (int): 0-3
             - reasoning (str): Judge's explanation
             - judge (str): Provider used
+            - judge_error (bool): Present and True when the judge failed
+              after retries (score will be None in this case)
     """
     if not model_answer or not model_answer.strip():
         return {
@@ -141,12 +154,41 @@ def score_answer(question, reference_answer, model_answer, judge="anthropic",
 
     prompt = build_judge_prompt(question, reference_answer, model_answer,
                                 model_name=model_name)
-    result = call_judge_api(judge, prompt)
 
+    last_error = None
+    retried = False
+    for attempt in range(1, JUDGE_MAX_RETRIES + 1):
+        try:
+            result = call_judge_api(judge, prompt)
+            score_result = {
+                "score": max(0, min(3, int(result.get("score", 0)))),
+                "reasoning": result.get("reasoning", ""),
+                "judge": judge,
+            }
+            if retried:
+                score_result["judge_error"] = True
+            return score_result
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            last_error = exc
+            retried = True
+            logger.warning(
+                "Judge API call failed (attempt %d/%d): %s",
+                attempt, JUDGE_MAX_RETRIES, exc,
+            )
+            if attempt < JUDGE_MAX_RETRIES:
+                time.sleep(JUDGE_RETRY_BACKOFF_SECONDS)
+
+    # All retries exhausted — do NOT score 0 because the judge failed,
+    # not the model. Flag for human review.
+    logger.error(
+        "Judge %s failed after %d retries: %s",
+        judge, JUDGE_MAX_RETRIES, last_error,
+    )
     return {
-        "score": max(0, min(3, int(result.get("score", 0)))),
-        "reasoning": result.get("reasoning", ""),
+        "score": None,
+        "reasoning": f"Judge scoring failed after {JUDGE_MAX_RETRIES} retries: {last_error}",
         "judge": judge,
+        "judge_error": True,
     }
 
 
@@ -168,6 +210,8 @@ def run_benchmark(questions, model_fn, model_name="unknown",
     """
     results = []
     total_score = 0
+    scored_count = 0
+    judge_errors = 0
     max_possible = len(questions) * 3
 
     for q in questions:
@@ -180,7 +224,11 @@ def run_benchmark(questions, model_fn, model_name="unknown",
             judge=judge,
             model_name=model_name,
         )
-        total_score += score_result["score"]
+        if score_result["score"] is not None:
+            total_score += score_result["score"]
+            scored_count += 1
+        if score_result.get("judge_error"):
+            judge_errors += 1
         results.append({
             "question_id": q["id"],
             "tier": q["tier"],
@@ -188,7 +236,8 @@ def run_benchmark(questions, model_fn, model_name="unknown",
             **score_result,
         })
 
-    percentage = (total_score / max_possible * 100) if max_possible > 0 else 0
+    effective_max = scored_count * 3
+    percentage = (total_score / effective_max * 100) if effective_max > 0 else 0
 
     return {
         "model": model_name,
@@ -196,6 +245,8 @@ def run_benchmark(questions, model_fn, model_name="unknown",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "total_score": total_score,
         "max_score": max_possible,
+        "scored_questions": scored_count,
+        "judge_errors": judge_errors,
         "percentage": round(percentage, 2),
         "num_questions": len(questions),
         "results": results,
