@@ -22,6 +22,11 @@ import os
 import time
 from datetime import datetime, timezone
 
+try:
+    from openai import AsyncOpenAI as _AsyncOpenAI
+except ImportError:  # openai SDK is optional unless --judge-panel is used
+    _AsyncOpenAI = None
+
 logger = logging.getLogger(__name__)
 
 # Judge provider configurations
@@ -233,13 +238,13 @@ PANEL_JUDGE_SYSTEM_PROMPT = (
 )
 
 
-async def _call_openrouter_judge_async(model, prompt, api_key):
+async def _call_openrouter_judge_async(model, prompt, client):
     """Async call to a single OpenRouter judge model.
 
     Args:
         model: OpenRouter model identifier (e.g., ``openai/gpt-4o``).
         prompt: Formatted judge prompt string.
-        api_key: OpenRouter API key.
+        client: Shared ``AsyncOpenAI`` client configured for OpenRouter.
 
     Returns:
         dict with ``score`` (int 0-100) and ``reasoning`` (str).
@@ -247,16 +252,6 @@ async def _call_openrouter_judge_async(model, prompt, api_key):
     Raises:
         RuntimeError: If the response cannot be parsed.
     """
-    from openai import AsyncOpenAI
-
-    client = AsyncOpenAI(
-        api_key=api_key,
-        base_url=OPENROUTER_BASE_URL,
-        default_headers={
-            "HTTP-Referer": OPENROUTER_HTTP_REFERER,
-            "X-Title": OPENROUTER_X_TITLE,
-        },
-    )
     response = await client.chat.completions.create(
         model=model,
         messages=[
@@ -276,6 +271,9 @@ async def _call_openrouter_judge_async(model, prompt, api_key):
 async def _score_panel_async(prompt, api_key):
     """Dispatch prompt to all panel judges simultaneously.
 
+    Creates a single shared ``AsyncOpenAI`` client for all requests to avoid
+    per-call construction overhead.
+
     Args:
         prompt: Formatted judge prompt string.
         api_key: OpenRouter API key.
@@ -283,8 +281,21 @@ async def _score_panel_async(prompt, api_key):
     Returns:
         List of results or exceptions, one per entry in ``JUDGE_PANEL``.
     """
+    if _AsyncOpenAI is None:
+        raise ImportError(
+            "openai SDK is required for --judge-panel. "
+            "Install it with: pip install openai"
+        )
+    client = _AsyncOpenAI(
+        api_key=api_key,
+        base_url=OPENROUTER_BASE_URL,
+        default_headers={
+            "HTTP-Referer": OPENROUTER_HTTP_REFERER,
+            "X-Title": OPENROUTER_X_TITLE,
+        },
+    )
     tasks = [
-        _call_openrouter_judge_async(model, prompt, api_key)
+        _call_openrouter_judge_async(model, prompt, client)
         for model in JUDGE_PANEL
     ]
     return await asyncio.gather(*tasks, return_exceptions=True)
