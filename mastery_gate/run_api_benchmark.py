@@ -93,7 +93,7 @@ def save_results(run_result, output_dir=None):
     versioned_dir = os.path.join(output_dir, version)
     os.makedirs(versioned_dir, exist_ok=True)
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S_%f")
     model_slug = run_result.get("model", "unknown").replace(" ", "_").lower()
     filename = f"{timestamp}_{model_slug}.json"
     filepath = os.path.join(versioned_dir, filename)

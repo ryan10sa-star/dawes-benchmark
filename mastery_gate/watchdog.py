@@ -290,8 +290,15 @@ def daemonize():
     # First fork
     pid = os.fork()
     if pid > 0:
-        # Parent exits
-        print(f"Watchdog daemon started (PID {pid})")
+        # Parent — wait briefly for grandchild PID file, then exit
+        time.sleep(0.5)
+        pid_file = os.path.join(DAWES_HOME, "watchdog.pid")
+        if os.path.exists(pid_file):
+            with open(pid_file, "r") as f:
+                daemon_pid = f.read().strip()
+            print(f"Watchdog daemon started (PID {daemon_pid})")
+        else:
+            print("Watchdog daemon started")
         sys.exit(0)
 
     os.setsid()
@@ -301,15 +308,20 @@ def daemonize():
     if pid > 0:
         sys.exit(0)
 
-    # Redirect standard file descriptors
-    sys.stdin = open(os.devnull, "r")
-    sys.stdout = open(WATCHDOG_LOG, "a")
-    sys.stderr = open(WATCHDOG_LOG, "a")
-
-    # Write PID file
+    # Write PID file before redirecting output
     pid_file = os.path.join(DAWES_HOME, "watchdog.pid")
+    os.makedirs(os.path.dirname(pid_file), exist_ok=True)
     with open(pid_file, "w") as f:
         f.write(str(os.getpid()))
+
+    # Redirect standard file descriptors using os.dup2 for proper cleanup
+    devnull_fd = os.open(os.devnull, os.O_RDONLY)
+    log_fd = os.open(WATCHDOG_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(devnull_fd, sys.stdin.fileno())
+    os.dup2(log_fd, sys.stdout.fileno())
+    os.dup2(log_fd, sys.stderr.fileno())
+    os.close(devnull_fd)
+    os.close(log_fd)
 
     run_watchdog_loop()
 
