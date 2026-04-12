@@ -194,6 +194,25 @@ def score_answer(question, reference_answer, model_answer, judge="anthropic",
 
 MULTI_JUDGE_DISAGREEMENT_THRESHOLD = 15  # points on 0-100 scale
 
+# Benchmark result versioning
+BENCHMARK_VERSION_BASE = "v1.0"       # Single-judge, non-blind runs
+BENCHMARK_VERSION_ENHANCED = "v1.2"   # Multi-judge and/or blind runs
+
+
+def determine_benchmark_version(multi_judge=False, blind=False):
+    """Determine the benchmark version string for a run.
+
+    Args:
+        multi_judge: Whether multi-judge panel scoring is enabled.
+        blind: Whether blind judging is enabled.
+
+    Returns:
+        Version string (e.g., "v1.0" or "v1.2").
+    """
+    if multi_judge or blind:
+        return BENCHMARK_VERSION_ENHANCED
+    return BENCHMARK_VERSION_BASE
+
 
 def score_answer_multi_judge(question, reference_answer, model_answer,
                              judges, model_name=None):
@@ -356,6 +375,9 @@ def run_benchmark(questions, model_fn, model_name="unknown",
 
     run_result = {
         "model": model_name,
+        "benchmark_version": determine_benchmark_version(
+            multi_judge=use_multi, blind=blind
+        ),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "total_score": round(total_score, 2),
         "max_score": max_possible,

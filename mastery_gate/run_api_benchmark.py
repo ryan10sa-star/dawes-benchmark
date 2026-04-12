@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 from benchmark_runner import (
     JUDGE_PROVIDERS,
+    determine_benchmark_version,
     run_benchmark,
     score_answer_multi_judge,
 )
@@ -72,21 +73,30 @@ def make_model_fn(model_name):
 def save_results(run_result, output_dir=None):
     """Save benchmark results to a JSON file.
 
+    Results are stored in version-specific subdirectories so that v1.0
+    and v1.2 results never overwrite each other.
+
     Args:
         run_result: The benchmark results dict.
-        output_dir: Directory to save results in. Defaults to RESULTS_DIR.
+        output_dir: Base directory to save results in. Defaults to RESULTS_DIR.
+                    A subdirectory named after the benchmark_version is
+                    created automatically.
 
     Returns:
         Path to the saved results file.
     """
     if output_dir is None:
         output_dir = RESULTS_DIR
-    os.makedirs(output_dir, exist_ok=True)
+
+    # Store in version-specific subdirectory
+    version = run_result.get("benchmark_version", "v1.0")
+    versioned_dir = os.path.join(output_dir, version)
+    os.makedirs(versioned_dir, exist_ok=True)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
     model_slug = run_result.get("model", "unknown").replace(" ", "_").lower()
     filename = f"{timestamp}_{model_slug}.json"
-    filepath = os.path.join(output_dir, filename)
+    filepath = os.path.join(versioned_dir, filename)
 
     with open(filepath, "w") as f:
         json.dump(run_result, f, indent=2)
