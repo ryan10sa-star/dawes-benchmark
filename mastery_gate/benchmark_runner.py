@@ -192,8 +192,100 @@ def score_answer(question, reference_answer, model_answer, judge="anthropic",
     }
 
 
+MULTI_JUDGE_DISAGREEMENT_THRESHOLD = 15  # points on 0-100 scale
+
+
+def score_answer_multi_judge(question, reference_answer, model_answer,
+                             judges, model_name=None):
+    """Score a single model answer using multiple judges (panel scoring).
+
+    Each judge scores the answer independently. The final score is the
+    average of all successful judge scores. If judges disagree by more than
+    MULTI_JUDGE_DISAGREEMENT_THRESHOLD points (on a 0-100 scale derived
+    from the 0-3 rubric), the question is flagged for human review.
+
+    Args:
+        question: The benchmark question text.
+        reference_answer: The reference/expected answer.
+        model_answer: The model's response.
+        judges: List of judge provider keys.
+        model_name: Name of the model (omitted in blind mode).
+
+    Returns:
+        dict with:
+            - score (float or None): Average score across judges
+            - reasoning (str): Combined reasoning summary
+            - judges_used (list[str]): Providers that participated
+            - judge_scores (list[dict]): Individual judge results
+            - judge_error (bool): True if any judge had errors
+            - human_review (bool): True if judge disagreement exceeds
+              threshold
+    """
+    if not model_answer or not model_answer.strip():
+        return {
+            "score": 0,
+            "reasoning": "Model provided no answer.",
+            "judges_used": judges,
+            "judge_scores": [],
+        }
+
+    individual_scores = []
+    any_error = False
+
+    for judge in judges:
+        result = score_answer(
+            question=question,
+            reference_answer=reference_answer,
+            model_answer=model_answer,
+            judge=judge,
+            model_name=model_name,
+        )
+        individual_scores.append(result)
+        if result.get("judge_error"):
+            any_error = True
+
+    # Compute average from judges that returned valid scores
+    valid_scores = [r["score"] for r in individual_scores
+                    if r["score"] is not None]
+
+    if not valid_scores:
+        return {
+            "score": None,
+            "reasoning": "All judges failed to score.",
+            "judges_used": judges,
+            "judge_scores": individual_scores,
+            "judge_error": True,
+            "human_review": True,
+        }
+
+    avg_score = sum(valid_scores) / len(valid_scores)
+
+    # Check for disagreement: convert 0-3 scores to 0-100 scale
+    scores_pct = [(s / 3) * 100 for s in valid_scores]
+    disagreement = max(scores_pct) - min(scores_pct) if len(scores_pct) > 1 else 0
+    needs_review = disagreement > MULTI_JUDGE_DISAGREEMENT_THRESHOLD
+
+    combined_reasoning = "; ".join(
+        f"[{r['judge']}] {r.get('reasoning', '')}" for r in individual_scores
+        if r["score"] is not None
+    )
+
+    result = {
+        "score": round(avg_score, 2),
+        "reasoning": combined_reasoning,
+        "judges_used": judges,
+        "judge_scores": individual_scores,
+    }
+    if any_error:
+        result["judge_error"] = True
+    if needs_review:
+        result["human_review"] = True
+        result["judge_disagreement_pct"] = round(disagreement, 2)
+    return result
+
+
 def run_benchmark(questions, model_fn, model_name="unknown",
-                  judge="anthropic"):
+                  judge="anthropic", judges=None, blind=False):
     """Run the full benchmark against a model.
 
     Args:
@@ -202,33 +294,56 @@ def run_benchmark(questions, model_fn, model_name="unknown",
         model_fn: Callable that takes a question string and returns the
                   model's answer string.
         model_name: Display name of the model being tested.
-        judge: Judge provider key for scoring.
+        judge: Single judge provider key for scoring (used when judges
+               is not specified).
+        judges: List of judge provider keys for multi-judge panel scoring.
+                When provided, overrides the single ``judge`` parameter.
+        blind: When True, strips model name from judge context before
+               scoring (blind judging mode).
 
     Returns:
         dict with benchmark results including per-question scores and
         aggregate statistics.
     """
+    use_multi = judges is not None and len(judges) > 1
+    effective_model_name = None if blind else model_name
+
     results = []
     total_score = 0
     scored_count = 0
     judge_errors = 0
+    human_review_count = 0
     max_possible = len(questions) * 3
 
     for q in questions:
         logger.info("Scoring question %s (tier %s)", q["id"], q["tier"])
         answer = model_fn(q["question"])
-        score_result = score_answer(
-            question=q["question"],
-            reference_answer=q["reference_answer"],
-            model_answer=answer,
-            judge=judge,
-            model_name=model_name,
-        )
+
+        if use_multi:
+            score_result = score_answer_multi_judge(
+                question=q["question"],
+                reference_answer=q["reference_answer"],
+                model_answer=answer,
+                judges=judges,
+                model_name=effective_model_name,
+            )
+        else:
+            active_judge = judges[0] if judges else judge
+            score_result = score_answer(
+                question=q["question"],
+                reference_answer=q["reference_answer"],
+                model_answer=answer,
+                judge=active_judge,
+                model_name=effective_model_name,
+            )
+
         if score_result["score"] is not None:
             total_score += score_result["score"]
             scored_count += 1
         if score_result.get("judge_error"):
             judge_errors += 1
+        if score_result.get("human_review"):
+            human_review_count += 1
         results.append({
             "question_id": q["id"],
             "tier": q["tier"],
@@ -239,15 +354,23 @@ def run_benchmark(questions, model_fn, model_name="unknown",
     effective_max = scored_count * 3
     percentage = (total_score / effective_max * 100) if effective_max > 0 else 0
 
-    return {
+    run_result = {
         "model": model_name,
-        "judge": judge,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "total_score": total_score,
+        "total_score": round(total_score, 2),
         "max_score": max_possible,
         "scored_questions": scored_count,
         "judge_errors": judge_errors,
         "percentage": round(percentage, 2),
         "num_questions": len(questions),
+        "blind": blind,
         "results": results,
     }
+
+    if use_multi:
+        run_result["judges"] = judges
+        run_result["human_review_flagged"] = human_review_count
+    else:
+        run_result["judge"] = judges[0] if judges else judge
+
+    return run_result

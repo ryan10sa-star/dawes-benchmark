@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from benchmark_runner import (
     JUDGE_PROVIDERS,
     run_benchmark,
+    score_answer_multi_judge,
 )
 
 logging.basicConfig(
@@ -113,7 +114,21 @@ def parse_args(argv=None):
     parser.add_argument(
         "--judge", default="anthropic",
         choices=list(JUDGE_PROVIDERS.keys()),
-        help="Judge provider for scoring (default: anthropic)"
+        help="Single judge provider for scoring (default: anthropic). "
+             "Ignored when --judges is specified."
+    )
+    parser.add_argument(
+        "--judges", nargs="+", default=None,
+        choices=list(JUDGE_PROVIDERS.keys()),
+        metavar="JUDGE",
+        help="Multiple judge providers for panel scoring (e.g., "
+             "--judges anthropic openai gemini). Scores are averaged "
+             "and disagreements > 15pts flagged for human review."
+    )
+    parser.add_argument(
+        "--blind", action="store_true", default=False,
+        help="Enable blind judging — strips model name from judge context "
+             "so judges score without knowing which model answered."
     )
     parser.add_argument(
         "--questions", default=None,
@@ -130,8 +145,11 @@ def main(argv=None):
     """Main entry point for the API benchmark runner."""
     args = parse_args(argv)
 
+    judges_list = args.judges if args.judges else None
+    judge_display = ", ".join(args.judges) if args.judges else args.judge
     logger.info("DAWES Benchmark Runner")
-    logger.info("Model: %s | Judge: %s", args.model, args.judge)
+    logger.info("Model: %s | Judge(s): %s | Blind: %s",
+                args.model, judge_display, args.blind)
 
     questions = load_questions(args.questions)
     logger.info("Loaded %d questions", len(questions))
@@ -143,6 +161,8 @@ def main(argv=None):
         model_fn=model_fn,
         model_name=args.model,
         judge=args.judge,
+        judges=judges_list,
+        blind=args.blind,
     )
 
     save_results(result, output_dir=args.output_dir)
