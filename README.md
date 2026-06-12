@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/relayforge-logo.png" alt="RelayForge" width="200" />
-</p>
-
 <h1 align="center">📊 DAWES</h1>
 
 <h3 align="center">Domain Anchored Workplace Expertise Standard<br/>The industrial AI benchmark that publishes honest failure data.</h3>
